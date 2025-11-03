@@ -1,8 +1,10 @@
 {
   "name": "nd-onedrive-uploader",
   "version": "1.0.0",
+  "private": true,
   "type": "module",
   "dependencies": {
-    "busboy": "^1.6.0"
+    "axios": "^1.6.0",
+    "form-data": "^4.0.0"
   }
 }
