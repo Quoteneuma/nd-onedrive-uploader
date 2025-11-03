@@ -1,195 +1,140 @@
-// api/upload.js
-// 使用環境變數：TENANT_ID, CLIENT_ID, CLIENT_SECRET, ONEDRIVE_USER_UPN, ROOT_FOLDER
-// 支援大檔 (Upload Session)；自動建立 ROOT_FOLDER 與 subpath 資料夾
-
-import formidable from "formidable";
-import fs from "fs";
+// api/upload.js — use Busboy (no Vercel file service), upload <=4MB via /content
+import Busboy from "busboy";
 
 export const config = { api: { bodyParser: false } };
 
-function mustEnv(name) {
+// ----- env helpers -----
+function need(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing ENV: ${name}`);
   return v;
 }
 
-// 逐段編碼 path，不編碼斜線
-function encodePath(p = "") {
-  return String(p)
-    .split("/")
-    .filter(Boolean)
-    .map(encodeURIComponent)
-    .join("/");
+// Encode單一段路徑（不把 / 編碼）
+function encSeg(s) {
+  return encodeURIComponent(String(s || "")).replace(/%2F/gi, "/");
 }
 
+// ----- MS Graph token -----
 async function getToken() {
-  const tenant = mustEnv("TENANT_ID");
-  const client = mustEnv("CLIENT_ID");
-  const secret = mustEnv("CLIENT_SECRET");
+  const tenant = need("TENANT_ID");
+  const client = need("CLIENT_ID");
+  const secret = need("CLIENT_SECRET");
 
-  const form = new URLSearchParams();
-  form.append("grant_type", "client_credentials");
-  form.append("client_id", client);
-  form.append("client_secret", secret);
-  form.append("scope", "https://graph.microsoft.com/.default");
+  const body = new URLSearchParams();
+  body.append("grant_type", "client_credentials");
+  body.append("client_id", client);
+  body.append("client_secret", secret);
+  body.append("scope", "https://graph.microsoft.com/.default");
 
   const url = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
   const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: form,
+    body
   });
+
   const raw = await r.text();
   let js = null;
   try { js = JSON.parse(raw); } catch {}
-
   if (!r.ok || !js?.access_token) {
-    throw new Error(`Token failed (${r.status}) ${raw?.slice(0, 200)}`);
+    console.error("[TOKEN_FAIL]", r.status, r.statusText, raw?.slice(0, 400));
+    throw new Error(`Token failed (${r.status})`);
   }
   return js.access_token;
 }
 
-async function graph(url, token, opts = {}) {
-  const r = await fetch(url, {
-    ...opts,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-      ...(opts.headers || {}),
-    },
-  });
-  const text = await r.text();
-  let data = null;
-  try { data = JSON.parse(text); } catch {}
-  if (!r.ok) {
-    const msg = data?.error?.message || text?.slice(0, 400);
-    throw new Error(`Graph ${r.status}: ${msg}`);
-  }
-  return data ?? text;
-}
+// ----- multipart 解析（Busboy）-----
+function parseMultipart(req) {
+  return new Promise((resolve, reject) => {
+    try {
+      const bb = Busboy({ headers: req.headers, limits: { files: 1, fileSize: 25 * 1024 * 1024 } }); // 25MB 上限（>4MB 要改用上傳工作階段）
+      const fields = {};
+      let filename = "file.bin";
+      let fileBufs = [];
 
-// 確保 /root:/A/B/C 存在（逐層建立資料夾）
-async function ensureFolders(driveBase, token, fullFolderPath) {
-  const parts = String(fullFolderPath || "")
-    .split("/")
-    .filter(Boolean);
-  if (!parts.length) return ""; // 根目錄
+      bb.on("file", (_name, stream, info) => {
+        if (info?.filename) filename = info.filename;
+        stream.on("data", (d) => fileBufs.push(d));
+        stream.on("limit", () => reject(new Error("File too large")));
+        stream.on("error", reject);
+      });
 
-  let built = "";
-  for (const part of parts) {
-    built = built ? `${built}/${part}` : part;
+      bb.on("field", (name, val) => {
+        fields[name] = val;
+      });
 
-    // 檢查是否存在
-    const pathUrl = `${driveBase}/root:/${encodePath(built)}`;
-    const exists = await fetch(pathUrl, { headers: { Authorization: `Bearer ${token}` } });
-    if (exists.ok) continue;
+      bb.on("finish", () => {
+        const buffer = Buffer.concat(fileBufs);
+        resolve({ fields, buffer, filename });
+      });
 
-    // 建立於 parent 的 children
-    const parent = built.split("/").slice(0, -1).join("/");
-    const childrenUrl = parent
-      ? `${driveBase}/root:/${encodePath(parent)}:/children`
-      : `${driveBase}/root/children`;
-
-    await graph(childrenUrl, token, {
-      method: "POST",
-      body: JSON.stringify({
-        name: part,
-        folder: {},
-        "@microsoft.graph.conflictBehavior": "replace",
-      }),
-    });
-  }
-  return fullFolderPath;
-}
-
-// 大檔分段上傳 (Upload Session)
-async function uploadViaSession(driveBase, token, targetPath, buffer) {
-  const createUrl = `${driveBase}/root:/${encodePath(targetPath)}:/createUploadSession`;
-  const session = await graph(createUrl, token, {
-    method: "POST",
-    body: JSON.stringify({
-      item: {
-        "@microsoft.graph.conflictBehavior": "replace",
-        name: targetPath.split("/").pop(),
-      },
-    }),
-  });
-  const uploadUrl = session?.uploadUrl;
-  if (!uploadUrl) throw new Error("No uploadUrl from createUploadSession");
-
-  const chunk = 5 * 1024 * 1024; // 5MB
-  const size = buffer.length;
-  let start = 0;
-  while (start < size) {
-    const end = Math.min(start + chunk, size) - 1;
-    const slice = buffer.slice(start, end + 1);
-    const r = await fetch(uploadUrl, {
-      method: "PUT",
-      headers: {
-        "Content-Length": String(slice.length),
-        "Content-Range": `bytes ${start}-${end}/${size}`,
-      },
-      body: slice,
-    });
-
-    // 202/201/200 都可能出現；完成時會回傳檔案資訊
-    if (r.status >= 400) {
-      const t = await r.text();
-      throw new Error(`Chunk upload failed (${r.status}): ${t?.slice(0, 200)}`);
+      req.pipe(bb);
+    } catch (e) {
+      reject(e);
     }
-
-    // 完成時會回傳 item
-    if (end + 1 === size) {
-      const t = await r.text();
-      try { return JSON.parse(t); } catch { return { ok: true, raw: t }; }
-    }
-    start = end + 1;
-  }
-  throw new Error("Unexpected end of upload loop");
+  });
 }
 
+// ----- handler -----
 export default async function handler(req, res) {
+  const t0 = Date.now();
   if (req.method !== "POST") {
-    return res.status(400).json({ ok: false, error: "Use POST" });
+    return res.status(400).json({ ok: false, error: "Use POST (multipart/form-data)" });
   }
 
   try {
-    // 解析 multipart
-    const form = formidable({ multiples: false });
-    const { fields, files } = await new Promise((resolve, reject) => {
-      form.parse(req, (err, flds, fls) => (err ? reject(err) : resolve({ fields: flds, files: fls })));
+    // 1) 解析 multipart
+    const { fields, buffer, filename: nameFromForm } = await parseMultipart(req);
+    if (!buffer || buffer.length === 0) {
+      return res.status(400).json({ ok: false, error: "No file received" });
+    }
+
+    // 2) 取 env 與路徑
+    const driveUser = need("ONEDRIVE_USER_UPN");
+    const root = need("ROOT_FOLDER"); // e.g. QuoteNeuma
+    const subpathRaw = String(fields.subpath || "").trim();  // e.g. QuoteNeuma\someone@email\2025-11-03
+    const overrideName = String(fields.filename || "").trim();
+    const finalName = overrideName || nameFromForm || "file.bin";
+
+    // subpath 正規化（把 \ 換成 /，分段編碼）
+    const normSub = subpathRaw.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+    const segs = [];
+    if (root) segs.push(root);
+    if (normSub) segs.push(...normSub.split("/").filter(Boolean));
+    segs.push(finalName);
+    const pathForGraph = segs.map(encSeg).join("/");
+
+    // 3) 取得 Graph token
+    const token = await getToken();
+
+    // 4) 直接 PUT /content（<=4MB；若大於 4MB 需改為 uploadSession）
+    const uploadUrl =
+      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(driveUser)}` +
+      `/drive/root:/${pathForGraph}:/content`;
+
+    const upr = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${token}` },
+      body: buffer
     });
 
-    if (!files?.file) {
-      return res.status(400).json({ ok: false, error: "No file uploaded" });
+    const respText = await upr.text();
+    let js = null; try { js = JSON.parse(respText); } catch {}
+
+    if (!upr.ok) {
+      console.error("[UPLOAD_FAIL]", upr.status, upr.statusText, respText?.slice(0, 400));
+      return res.status(500).json({
+        ok: false,
+        error: `Upload failed (${upr.status})`,
+        hint: js?.error?.message || respText?.slice(0, 200)
+      });
     }
 
-    const token = await getToken();
-    const upn = mustEnv("ONEDRIVE_USER_UPN");
-    const rootFolder = (process.env.ROOT_FOLDER || "").trim();
-
-    const driveBase = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(upn)}/drive`;
-
-    // 組目錄：ROOT_FOLDER / subpath
-    const subpath = String(fields.subpath || "").replace(/^\/+/, "");
-    const folderPath = [rootFolder, subpath].filter(Boolean).join("/");
-
-    if (folderPath) {
-      await ensureFolders(driveBase, token, folderPath);
-    }
-
-    // 檔名
-    const filename =
-      String(fields.filename || files.file.originalFilename || "file.bin").trim() || "file.bin";
-
-    // 讀檔 & 上傳
-    const buffer = fs.readFileSync(files.file.filepath);
-    const target = [folderPath, filename].filter(Boolean).join("/");
-
-    const item = await uploadViaSession(driveBase, token, target, buffer);
-
-    return res.status(200).json({ ok: true, item });
+    console.log("[UPLOAD_OK]", finalName, `${Date.now() - t0}ms`);
+    return res.status(200).json({ ok: true, item: js || null });
   } catch (e) {
+    console.error("[SERVER_ERROR]", e?.message || e);
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 }
