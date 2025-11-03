@@ -1,4 +1,4 @@
-// api/diag.js — 環境變數/Token 診斷端點（只顯示有無，不洩漏祕密）
+// api/diag.js — 環境變數/Token 診斷端點
 export const config = { api: { bodyParser: false } };
 
 function setCORS(res){
@@ -47,10 +47,10 @@ export default async function handler(req, res){
       if (r.ok && js?.access_token) {
         result.tokenOk = true;
       } else {
-        result.tokenError = raw?.slice(0, 400) || `HTTP ${r.status}`;
+        result.tokenError = raw?.slice(0, 500) || `HTTP ${r.status}`;
       }
     } else {
-      result.tokenError = 'Missing one or more ENV: TENANT_ID/CLIENT_ID/CLIENT_SECRET';
+      result.tokenError = 'Missing ENV';
     }
   } catch (e) {
     result.tokenError = e?.message || String(e);
