@@ -1,0 +1,7 @@
+{
+  "functions": { "api/*.js": { "runtime": "nodejs18.x" } },
+  "routes": [
+    { "src": "/apps/nd-upload/health", "dest": "/api/health" },
+    { "src": "/apps/nd-upload/upload", "dest": "/api/upload" }
+  ]
+}
