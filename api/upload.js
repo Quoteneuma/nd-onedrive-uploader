@@ -1,4 +1,7 @@
-// api/upload.js — with verbose logs
+// api/upload.js
+// 使用環境變數：TENANT_ID, CLIENT_ID, CLIENT_SECRET, ONEDRIVE_USER_UPN, ROOT_FOLDER
+// 支援大檔 (Upload Session)；自動建立 ROOT_FOLDER 與 subpath 資料夾
+
 import formidable from "formidable";
 import fs from "fs";
 
@@ -8,6 +11,15 @@ function mustEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing ENV: ${name}`);
   return v;
+}
+
+// 逐段編碼 path，不編碼斜線
+function encodePath(p = "") {
+  return String(p)
+    .split("/")
+    .filter(Boolean)
+    .map(encodeURIComponent)
+    .join("/");
 }
 
 async function getToken() {
@@ -27,74 +39,157 @@ async function getToken() {
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: form,
   });
-
   const raw = await r.text();
   let js = null;
-  try { js = JSON.parse(raw); } catch { /* keep raw */ }
+  try { js = JSON.parse(raw); } catch {}
 
   if (!r.ok || !js?.access_token) {
-    console.error("[TOKEN_FAIL]", r.status, r.statusText, raw?.slice(0, 400));
-    throw new Error(`Token failed (${r.status})`);
+    throw new Error(`Token failed (${r.status}) ${raw?.slice(0, 200)}`);
   }
-
   return js.access_token;
 }
 
+async function graph(url, token, opts = {}) {
+  const r = await fetch(url, {
+    ...opts,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      ...(opts.headers || {}),
+    },
+  });
+  const text = await r.text();
+  let data = null;
+  try { data = JSON.parse(text); } catch {}
+  if (!r.ok) {
+    const msg = data?.error?.message || text?.slice(0, 400);
+    throw new Error(`Graph ${r.status}: ${msg}`);
+  }
+  return data ?? text;
+}
+
+// 確保 /root:/A/B/C 存在（逐層建立資料夾）
+async function ensureFolders(driveBase, token, fullFolderPath) {
+  const parts = String(fullFolderPath || "")
+    .split("/")
+    .filter(Boolean);
+  if (!parts.length) return ""; // 根目錄
+
+  let built = "";
+  for (const part of parts) {
+    built = built ? `${built}/${part}` : part;
+
+    // 檢查是否存在
+    const pathUrl = `${driveBase}/root:/${encodePath(built)}`;
+    const exists = await fetch(pathUrl, { headers: { Authorization: `Bearer ${token}` } });
+    if (exists.ok) continue;
+
+    // 建立於 parent 的 children
+    const parent = built.split("/").slice(0, -1).join("/");
+    const childrenUrl = parent
+      ? `${driveBase}/root:/${encodePath(parent)}:/children`
+      : `${driveBase}/root/children`;
+
+    await graph(childrenUrl, token, {
+      method: "POST",
+      body: JSON.stringify({
+        name: part,
+        folder: {},
+        "@microsoft.graph.conflictBehavior": "replace",
+      }),
+    });
+  }
+  return fullFolderPath;
+}
+
+// 大檔分段上傳 (Upload Session)
+async function uploadViaSession(driveBase, token, targetPath, buffer) {
+  const createUrl = `${driveBase}/root:/${encodePath(targetPath)}:/createUploadSession`;
+  const session = await graph(createUrl, token, {
+    method: "POST",
+    body: JSON.stringify({
+      item: {
+        "@microsoft.graph.conflictBehavior": "replace",
+        name: targetPath.split("/").pop(),
+      },
+    }),
+  });
+  const uploadUrl = session?.uploadUrl;
+  if (!uploadUrl) throw new Error("No uploadUrl from createUploadSession");
+
+  const chunk = 5 * 1024 * 1024; // 5MB
+  const size = buffer.length;
+  let start = 0;
+  while (start < size) {
+    const end = Math.min(start + chunk, size) - 1;
+    const slice = buffer.slice(start, end + 1);
+    const r = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: {
+        "Content-Length": String(slice.length),
+        "Content-Range": `bytes ${start}-${end}/${size}`,
+      },
+      body: slice,
+    });
+
+    // 202/201/200 都可能出現；完成時會回傳檔案資訊
+    if (r.status >= 400) {
+      const t = await r.text();
+      throw new Error(`Chunk upload failed (${r.status}): ${t?.slice(0, 200)}`);
+    }
+
+    // 完成時會回傳 item
+    if (end + 1 === size) {
+      const t = await r.text();
+      try { return JSON.parse(t); } catch { return { ok: true, raw: t }; }
+    }
+    start = end + 1;
+  }
+  throw new Error("Unexpected end of upload loop");
+}
+
 export default async function handler(req, res) {
-  const start = Date.now();
   if (req.method !== "POST") {
     return res.status(400).json({ ok: false, error: "Use POST" });
   }
 
   try {
-    // 解析表單
+    // 解析 multipart
     const form = formidable({ multiples: false });
     const { fields, files } = await new Promise((resolve, reject) => {
       form.parse(req, (err, flds, fls) => (err ? reject(err) : resolve({ fields: flds, files: fls })));
     });
 
-    const driveUser = mustEnv("ONEDRIVE_USER_UPN"); // 例如 marketing@nanyaplastics-usa.com
-    const subpath = String(fields.subpath || "").replace(/^\/+/, "");
-    const filename = String(fields.filename || files?.file?.originalFilename || "file.bin");
-
     if (!files?.file) {
       return res.status(400).json({ ok: false, error: "No file uploaded" });
     }
 
-    // 先拿 Token
     const token = await getToken();
+    const upn = mustEnv("ONEDRIVE_USER_UPN");
+    const rootFolder = (process.env.ROOT_FOLDER || "").trim();
 
-    // 讀檔
-    const buffer = fs.readFileSync(files.file.filepath);
+    const driveBase = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(upn)}/drive`;
 
-    // 目標：User Drive（app-only 不可用 /me/drive，要用 /users/{UPN}/drive）
-    const uploadUrl =
-      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(driveUser)}` +
-      `/drive/root:/${subpath ? subpath + "/" : ""}${encodeURIComponent(filename)}:/content`;
+    // 組目錄：ROOT_FOLDER / subpath
+    const subpath = String(fields.subpath || "").replace(/^\/+/, "");
+    const folderPath = [rootFolder, subpath].filter(Boolean).join("/");
 
-    const upr = await fetch(uploadUrl, {
-      method: "PUT",
-      headers: { Authorization: `Bearer ${token}` },
-      body: buffer,
-    });
-
-    const upRaw = await upr.text();
-    let upJs = null;
-    try { upJs = JSON.parse(upRaw); } catch {}
-
-    if (!upr.ok) {
-      console.error("[UPLOAD_FAIL]", upr.status, upr.statusText, upRaw?.slice(0, 400));
-      return res.status(500).json({
-        ok: false,
-        error: `Upload failed (${upr.status})`,
-        hint: upJs?.error?.message || upRaw?.slice(0, 200),
-      });
+    if (folderPath) {
+      await ensureFolders(driveBase, token, folderPath);
     }
 
-    console.log("[UPLOAD_OK]", filename, `${Date.now() - start}ms`);
-    return res.status(200).json({ ok: true, item: upJs || null });
+    // 檔名
+    const filename =
+      String(fields.filename || files.file.originalFilename || "file.bin").trim() || "file.bin";
+
+    // 讀檔 & 上傳
+    const buffer = fs.readFileSync(files.file.filepath);
+    const target = [folderPath, filename].filter(Boolean).join("/");
+
+    const item = await uploadViaSession(driveBase, token, target, buffer);
+
+    return res.status(200).json({ ok: true, item });
   } catch (e) {
-    console.error("[SERVER_ERROR]", e?.message || e);
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 }
