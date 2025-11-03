@@ -1,37 +1,40 @@
-// api/upload.js — use Busboy (no Vercel file service), upload <=4MB via /content
-import Busboy from "busboy";
+// api/upload.js  —— 以 5 個 ENV 為準 + CORS + OPTIONS
+import formidable from "formidable";
+import fs from "fs";
 
 export const config = { api: { bodyParser: false } };
 
-// ----- env helpers -----
+// ---- CORS ----
+function setCORS(res) {
+  // 如果要鎖網域，把 * 換成你的 Shopify 網域（含 https）
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+// ---- ENV helpers ----
 function need(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing ENV: ${name}`);
   return v;
 }
 
-// Encode單一段路徑（不把 / 編碼）
-function encSeg(s) {
-  return encodeURIComponent(String(s || "")).replace(/%2F/gi, "/");
-}
-
-// ----- MS Graph token -----
 async function getToken() {
   const tenant = need("TENANT_ID");
   const client = need("CLIENT_ID");
   const secret = need("CLIENT_SECRET");
 
-  const body = new URLSearchParams();
-  body.append("grant_type", "client_credentials");
-  body.append("client_id", client);
-  body.append("client_secret", secret);
-  body.append("scope", "https://graph.microsoft.com/.default");
+  const form = new URLSearchParams();
+  form.append("grant_type", "client_credentials");
+  form.append("client_id", client);
+  form.append("client_secret", secret);
+  form.append("scope", "https://graph.microsoft.com/.default");
 
   const url = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
   const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body
+    body: form
   });
 
   const raw = await r.text();
@@ -44,95 +47,64 @@ async function getToken() {
   return js.access_token;
 }
 
-// ----- multipart 解析（Busboy）-----
-function parseMultipart(req) {
-  return new Promise((resolve, reject) => {
-    try {
-      const bb = Busboy({ headers: req.headers, limits: { files: 1, fileSize: 25 * 1024 * 1024 } }); // 25MB 上限（>4MB 要改用上傳工作階段）
-      const fields = {};
-      let filename = "file.bin";
-      let fileBufs = [];
-
-      bb.on("file", (_name, stream, info) => {
-        if (info?.filename) filename = info.filename;
-        stream.on("data", (d) => fileBufs.push(d));
-        stream.on("limit", () => reject(new Error("File too large")));
-        stream.on("error", reject);
-      });
-
-      bb.on("field", (name, val) => {
-        fields[name] = val;
-      });
-
-      bb.on("finish", () => {
-        const buffer = Buffer.concat(fileBufs);
-        resolve({ fields, buffer, filename });
-      });
-
-      req.pipe(bb);
-    } catch (e) {
-      reject(e);
-    }
-  });
-}
-
-// ----- handler -----
 export default async function handler(req, res) {
-  const t0 = Date.now();
+  setCORS(res);
+  if (req.method === "OPTIONS") {
+    return res.status(204).end(); // 預檢直接放行
+  }
   if (req.method !== "POST") {
-    return res.status(400).json({ ok: false, error: "Use POST (multipart/form-data)" });
+    return res.status(405).json({ ok: false, error: "Use POST" });
   }
 
   try {
-    // 1) 解析 multipart
-    const { fields, buffer, filename: nameFromForm } = await parseMultipart(req);
-    if (!buffer || buffer.length === 0) {
-      return res.status(400).json({ ok: false, error: "No file received" });
-    }
+    const upn = need("ONEDRIVE_USER_UPN");      // 例如 marketing@nanyaplastics-usa.com
+    const root = need("ROOT_FOLDER");           // 例如 QuoteNeuma
 
-    // 2) 取 env 與路徑
-    const driveUser = need("ONEDRIVE_USER_UPN");
-    const root = need("ROOT_FOLDER"); // e.g. QuoteNeuma
-    const subpathRaw = String(fields.subpath || "").trim();  // e.g. QuoteNeuma\someone@email\2025-11-03
-    const overrideName = String(fields.filename || "").trim();
-    const finalName = overrideName || nameFromForm || "file.bin";
-
-    // subpath 正規化（把 \ 換成 /，分段編碼）
-    const normSub = subpathRaw.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
-    const segs = [];
-    if (root) segs.push(root);
-    if (normSub) segs.push(...normSub.split("/").filter(Boolean));
-    segs.push(finalName);
-    const pathForGraph = segs.map(encSeg).join("/");
-
-    // 3) 取得 Graph token
-    const token = await getToken();
-
-    // 4) 直接 PUT /content（<=4MB；若大於 4MB 需改為 uploadSession）
-    const uploadUrl =
-      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(driveUser)}` +
-      `/drive/root:/${pathForGraph}:/content`;
-
-    const upr = await fetch(uploadUrl, {
-      method: "PUT",
-      headers: { Authorization: `Bearer ${token}` },
-      body: buffer
+    // 解析 multipart
+    const form = formidable({ multiples: false, keepExtensions: true });
+    const { fields, files } = await new Promise((resolve, reject) => {
+      form.parse(req, (err, flds, fls) => (err ? reject(err) : resolve({ fields: flds, files: fls })));
     });
 
-    const respText = await upr.text();
-    let js = null; try { js = JSON.parse(respText); } catch {}
+    const fileObj = files?.file;
+    if (!fileObj) return res.status(400).json({ ok: false, error: "No file" });
+
+    const subpath = String(fields?.subpath || "").replace(/^\/+/, "");
+    const filename = String(fields?.filename || fileObj.originalFilename || "file.bin");
+
+    // 讀檔
+    const buf = fs.readFileSync(fileObj.filepath);
+
+    const token = await getToken();
+
+    // 目標路徑：/users/{UPN}/drive/root:/ROOT_FOLDER/subpath/filename:/content
+    const prefix = root ? `${root}/${subpath}`.replace(/\/+$/,"") : subpath;
+    const drivePath = prefix ? `${prefix}/${filename}` : filename;
+
+    const url =
+      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(upn)}` +
+      `/drive/root:/${encodeURIComponent(drivePath).replace(/%2F/g,"/")}:/content`;
+
+    const upr = await fetch(url, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${token}` },
+      body: buf
+    });
+
+    const upRaw = await upr.text();
+    let upJs = null;
+    try { upJs = JSON.parse(upRaw); } catch {}
 
     if (!upr.ok) {
-      console.error("[UPLOAD_FAIL]", upr.status, upr.statusText, respText?.slice(0, 400));
+      console.error("[UPLOAD_FAIL]", upr.status, upr.statusText, upRaw?.slice(0, 400));
       return res.status(500).json({
         ok: false,
         error: `Upload failed (${upr.status})`,
-        hint: js?.error?.message || respText?.slice(0, 200)
+        hint: upJs?.error?.message || upRaw?.slice(0, 200)
       });
     }
 
-    console.log("[UPLOAD_OK]", finalName, `${Date.now() - t0}ms`);
-    return res.status(200).json({ ok: true, item: js || null });
+    return res.status(200).json({ ok: true, item: upJs || null });
   } catch (e) {
     console.error("[SERVER_ERROR]", e?.message || e);
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
