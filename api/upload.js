@@ -1,140 +1,100 @@
-// Vercel Serverless Function: /api/upload
-// 解析 multipart，將 PDF / XLSX 上傳到 OneDrive/QuoteNeuma/...，並寫 metadata.json
-import Busboy from "busboy";
+// api/upload.js — with verbose logs
+import formidable from "formidable";
+import fs from "fs";
 
-const ROOT = process.env.ROOT_FOLDER || "QuoteNeuma";
-const UPN  = process.env.ONEDRIVE_USER_UPN; // 例如 marketing@nanyaplastics-usa.com
+export const config = { api: { bodyParser: false } };
 
-function pad2(n){ return String(n).padStart(2,"0"); }
-function safe(s){ return String(s||"").toLowerCase().replace(/[^a-z0-9._-]+/g,"-").replace(/-+/g,"-"); }
+function mustEnv(name) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing ENV: ${name}`);
+  return v;
+}
 
-async function getAccessToken(){
-  const resp = await fetch(`https://login.microsoftonline.com/${process.env.TENANT_ID}/oauth2/v2.0/token`, {
+async function getToken() {
+  const tenant = mustEnv("TENANT_ID");
+  const client = mustEnv("CLIENT_ID");
+  const secret = mustEnv("CLIENT_SECRET");
+
+  const form = new URLSearchParams();
+  form.append("grant_type", "client_credentials");
+  form.append("client_id", client);
+  form.append("client_secret", secret);
+  form.append("scope", "https://graph.microsoft.com/.default");
+
+  const url = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
+  const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_id: process.env.CLIENT_ID,
-      client_secret: process.env.CLIENT_SECRET,
-      scope: "https://graph.microsoft.com/.default",
-      grant_type: "client_credentials"
-    })
+    body: form,
   });
-  const json = await resp.json();
-  if (!json.access_token) throw new Error("Get token failed: " + JSON.stringify(json));
-  return json.access_token;
+
+  const raw = await r.text();
+  let js = null;
+  try { js = JSON.parse(raw); } catch { /* keep raw */ }
+
+  if (!r.ok || !js?.access_token) {
+    console.error("[TOKEN_FAIL]", r.status, r.statusText, raw?.slice(0, 400));
+    throw new Error(`Token failed (${r.status})`);
+  }
+
+  return js.access_token;
 }
 
-// <=4MB 直接 PUT；>4MB 走 Upload Session 分段
-async function uploadToOneDrive({ token, upn, path, buffer }){
-  const base = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(upn)}/drive/root:/${encodeURI(path)}`;
-  if (buffer.byteLength <= 4*1024*1024) {
-    const r = await fetch(`${base}:/content`, {
+export default async function handler(req, res) {
+  const start = Date.now();
+  if (req.method !== "POST") {
+    return res.status(400).json({ ok: false, error: "Use POST" });
+  }
+
+  try {
+    // 解析表單
+    const form = formidable({ multiples: false });
+    const { fields, files } = await new Promise((resolve, reject) => {
+      form.parse(req, (err, flds, fls) => (err ? reject(err) : resolve({ fields: flds, files: fls })));
+    });
+
+    const driveUser = mustEnv("DRIVE_USER"); // 例如 marketing@nanyaplastics-usa.com
+    const subpath = String(fields.subpath || "").replace(/^\/+/, "");
+    const filename = String(fields.filename || files?.file?.originalFilename || "file.bin");
+
+    if (!files?.file) {
+      return res.status(400).json({ ok: false, error: "No file uploaded" });
+    }
+
+    // 先拿 Token
+    const token = await getToken();
+
+    // 讀檔
+    const buffer = fs.readFileSync(files.file.filepath);
+
+    // 目標：User Drive（app-only 不可用 /me/drive，要用 /users/{UPN}/drive）
+    const uploadUrl =
+      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(driveUser)}` +
+      `/drive/root:/${subpath ? subpath + "/" : ""}${encodeURIComponent(filename)}:/content`;
+
+    const upr = await fetch(uploadUrl, {
       method: "PUT",
       headers: { Authorization: `Bearer ${token}` },
-      body: buffer
+      body: buffer,
     });
-    if (!r.ok) throw new Error(`PUT ${r.status}: ${await r.text()}`);
-    return await r.json();
-  }
-  const r1 = await fetch(`${base}:/createUploadSession`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ item: { "@microsoft.graph.conflictBehavior": "replace" } })
-  });
-  const sess = await r1.json();
-  if (!sess.uploadUrl) throw new Error("Create session failed: " + JSON.stringify(sess));
 
-  const url = sess.uploadUrl;
-  const chunk = 5*1024*1024;
-  let start = 0;
-  while (start < buffer.byteLength) {
-    const end = Math.min(start + chunk, buffer.byteLength);
-    const slice = buffer.slice(start, end);
-    const r = await fetch(url, {
-      method: "PUT",
-      headers: {
-        "Content-Length": String(slice.byteLength),
-        "Content-Range": `bytes ${start}-${end-1}/${buffer.byteLength}`
-      },
-      body: slice
-    });
-    if (!(r.ok || r.status === 202)) throw new Error(`Chunk ${start}-${end} failed: ${r.status} ${await r.text()}`);
-    start = end;
-  }
-  return { ok: true };
-}
+    const upRaw = await upr.text();
+    let upJs = null;
+    try { upJs = JSON.parse(upRaw); } catch {}
 
-// 解析 multipart（支援 pdf/xlsx 兩個欄位）
-function parseMultipart(req){
-  return new Promise((resolve, reject) => {
-    const bb = Busboy({ headers: req.headers });
-    const fields = {};
-    const files = {}; // { pdf: {filename, mime, data:Buffer}, xlsx: {...} }
-    bb.on("file", (name, file, info) => {
-      const { filename, mimeType } = info;
-      const chunks = [];
-      file.on("data", d => chunks.push(d));
-      file.on("end", () => { files[name] = { filename, mime: mimeType, data: Buffer.concat(chunks) }; });
-    });
-    bb.on("field", (name, val) => { fields[name] = val; });
-    bb.on("error", reject);
-    bb.on("finish", () => resolve({ fields, files }));
-    req.pipe(bb);
-  });
-}
-
-export default async function handler(req, res){
-  try{
-    if (req.method !== "POST") {
-      res.status(405).json({ ok:false, error:"Use POST" });
-      return;
-    }
-    if (!UPN) {
-      res.status(500).json({ ok:false, error:"Missing ONEDRIVE_USER_UPN" });
-      return;
+    if (!upr.ok) {
+      console.error("[UPLOAD_FAIL]", upr.status, upr.statusText, upRaw?.slice(0, 400));
+      return res.status(500).json({
+        ok: false,
+        error: `Upload failed (${upr.status})`,
+        hint: upJs?.error?.message || upRaw?.slice(0, 200),
+      });
     }
 
-    const { fields, files } = await parseMultipart(req);
-    const token = await getAccessToken();
-
-    const serial = fields.serial || "GUEST-0000";
-    const customerEmail = fields.customerEmail || "guest";
-    const pageUrl = fields.pageUrl || "";
-    const userAgent = fields.userAgent || "";
-    let cart = {};
-    try { cart = JSON.parse(fields.cartJson || "{}"); } catch {}
-
-    const now = new Date();
-    const yyyy = now.getFullYear();
-    const mmdd = `${pad2(now.getMonth()+1)}${pad2(now.getDate())}`;
-    const baseDir = `${ROOT}/${safe(customerEmail)}/${yyyy}/${mmdd}/${safe(serial)}`;
-
-    const out = [];
-    for (const name of ["pdf","xlsx"]) {
-      const f = files[name];
-      if (!f) continue;
-      const fname = f.filename || `ND-${serial}.${name}`;
-      const path = `${baseDir}/${fname}`;
-      await uploadToOneDrive({ token, upn: UPN, path, buffer: f.data });
-      out.push({ path, filename: fname, size: f.data.length, mime: f.mime });
-    }
-
-    const meta = {
-      serial,
-      customerEmail,
-      when: now.toISOString(),
-      pageUrl,
-      userAgent,
-      files: out,
-      cart,
-      version: "v1"
-    };
-    await uploadToOneDrive({
-      token, upn: UPN, path: `${baseDir}/metadata.json`, buffer: Buffer.from(JSON.stringify(meta, null, 2))
-    });
-
-    res.status(200).json({ ok:true, folder: baseDir, files: out, meta: `${baseDir}/metadata.json` });
-  }catch(e){
-    res.status(500).json({ ok:false, error: String(e?.message || e) });
+    console.log("[UPLOAD_OK]", filename, `${Date.now() - start}ms`);
+    return res.status(200).json({ ok: true, item: upJs || null });
+  } catch (e) {
+    console.error("[SERVER_ERROR]", e?.message || e);
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 }
