@@ -1,6 +1,5 @@
 {
   "routes": [
-    { "src": "/apps/nd-upload/health", "dest": "/api/health.js" },
-    { "src": "/apps/nd-upload/upload", "methods": ["POST"], "dest": "/api/upload.js" }
+    { "src": "/apps/nd-upload/(.*)", "dest": "/api/$1" }
   ]
 }
