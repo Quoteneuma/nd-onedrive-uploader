@@ -53,7 +53,7 @@ export default async function handler(req, res) {
       form.parse(req, (err, flds, fls) => (err ? reject(err) : resolve({ fields: flds, files: fls })));
     });
 
-    const driveUser = mustEnv("DRIVE_USER"); // 例如 marketing@nanyaplastics-usa.com
+    const driveUser = mustEnv("ONEDRIVE_USER_UPN"); // 例如 marketing@nanyaplastics-usa.com
     const subpath = String(fields.subpath || "").replace(/^\/+/, "");
     const filename = String(fields.filename || files?.file?.originalFilename || "file.bin");
 
