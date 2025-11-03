@@ -28,7 +28,6 @@ export default async function handler(req, res){
     tokenError: null
   };
 
-  // 試拿 token（不回傳 token）
   try {
     if (has('TENANT_ID') && has('CLIENT_ID') && has('CLIENT_SECRET')) {
       const form = new URLSearchParams();
