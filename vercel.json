@@ -1,7 +1,6 @@
 {
-  "version": 2,
-  "rewrites": [
-    { "source": "/apps/nd-upload/health", "destination": "/api/health" },
-    { "source": "/apps/nd-upload/upload", "destination": "/api/upload" }
+  "routes": [
+    { "src": "/apps/nd-upload/health", "dest": "/api/health.js" },
+    { "src": "/apps/nd-upload/upload", "methods": ["POST"], "dest": "/api/upload.js" }
   ]
 }
