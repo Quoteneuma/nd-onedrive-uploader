@@ -1,4 +1,4 @@
-// api/diag.js — 環境變數/Token 診斷端點
+// api/diag.js — 環境變數 / Token 診斷端點
 export const config = { api: { bodyParser: false } };
 
 function setCORS(res){
@@ -12,9 +12,6 @@ export default async function handler(req, res){
   if (req.method === 'OPTIONS') return res.status(204).end();
 
   const has = k => !!(process.env[k] && String(process.env[k]).trim());
-  const tenant = process.env.TENANT_ID;
-  const client = process.env.CLIENT_ID;
-  const secret = process.env.CLIENT_SECRET;
 
   const result = {
     envPresent: {
@@ -32,22 +29,24 @@ export default async function handler(req, res){
     if (has('TENANT_ID') && has('CLIENT_ID') && has('CLIENT_SECRET')) {
       const form = new URLSearchParams();
       form.append('grant_type', 'client_credentials');
-      form.append('client_id', client);
-      form.append('client_secret', secret);
+      form.append('client_id', process.env.CLIENT_ID);
+      form.append('client_secret', process.env.CLIENT_SECRET);
       form.append('scope', 'https://graph.microsoft.com/.default');
 
-      const url = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
+      const url = `https://login.microsoftonline.com/${process.env.TENANT_ID}/oauth2/v2.0/token`;
       const r = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: form
       });
+
       const raw = await r.text();
       let js = null; try { js = JSON.parse(raw); } catch {}
+
       if (r.ok && js?.access_token) {
         result.tokenOk = true;
       } else {
-        result.tokenError = raw?.slice(0, 500) || `HTTP ${r.status}`;
+        result.tokenError = raw?.slice(0, 500);
       }
     } else {
       result.tokenError = 'Missing ENV';
