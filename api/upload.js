@@ -1,24 +1,25 @@
-// api/upload.js  —— 以 5 個 ENV 為準 + CORS + OPTIONS
+// api/upload.js — 以 5 個 ENV 為準 + CORS + OPTIONS（可直接整檔貼上）
 import formidable from "formidable";
 import fs from "fs";
 
 export const config = { api: { bodyParser: false } };
 
-// ---- CORS ----
+/* ---------------- CORS ---------------- */
 function setCORS(res) {
-  // 如果要鎖網域，把 * 換成你的 Shopify 網域（含 https）
+  // 若要鎖定來源，將 "*" 改成你的 Shopify 網域（含 https）
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-// ---- ENV helpers ----
+/* --------------- ENV 取值 --------------- */
 function need(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing ENV: ${name}`);
   return v;
 }
 
+/* --------------- 取 Graph Token --------------- */
 async function getToken() {
   const tenant = need("TENANT_ID");
   const client = need("CLIENT_ID");
@@ -47,18 +48,20 @@ async function getToken() {
   return js.access_token;
 }
 
+/* --------------- 上傳主程式 --------------- */
 export default async function handler(req, res) {
   setCORS(res);
+
   if (req.method === "OPTIONS") {
-    return res.status(204).end(); // 預檢直接放行
+    return res.status(204).end(); // CORS 預檢
   }
   if (req.method !== "POST") {
     return res.status(405).json({ ok: false, error: "Use POST" });
   }
 
   try {
-    const upn = need("ONEDRIVE_USER_UPN");      // 例如 marketing@nanyaplastics-usa.com
-    const root = need("ROOT_FOLDER");           // 例如 QuoteNeuma
+    const upn  = need("ONEDRIVE_USER_UPN"); // 例如 marketing@nanyaplastics-usa.com
+    const root = need("ROOT_FOLDER");       // 例如 QuoteNeuma
 
     // 解析 multipart
     const form = formidable({ multiples: false, keepExtensions: true });
@@ -66,21 +69,36 @@ export default async function handler(req, res) {
       form.parse(req, (err, flds, fls) => (err ? reject(err) : resolve({ fields: flds, files: fls })));
     });
 
-    const fileObj = files?.file;
+    // 兼容 formidable 各版本/型態：可能是單一物件或陣列；路徑屬性可能為 filepath 或 path
+    const fileField = files?.file;
+    const fileObj = Array.isArray(fileField) ? fileField[0] : fileField;
     if (!fileObj) return res.status(400).json({ ok: false, error: "No file" });
 
-    const subpath = String(fields?.subpath || "").replace(/^\/+/, "");
+    const localPath =
+      fileObj?.filepath ||
+      fileObj?.path ||
+      fileObj?.file?.filepath ||
+      null;
+
+    if (!localPath) {
+      console.error("[NO_LOCAL_PATH]", { fileObjKeys: Object.keys(fileObj || {}) });
+      return res.status(400).json({ ok: false, error: "Upload parse failed: no file path" });
+    }
+
+    const subpath  = String(fields?.subpath || "").replace(/^\/+/, "");
     const filename = String(fields?.filename || fileObj.originalFilename || "file.bin");
 
     // 讀檔
-    const buf = fs.readFileSync(fileObj.filepath);
+    const buf = fs.readFileSync(localPath);
 
+    // 取 Token
     const token = await getToken();
 
     // 目標路徑：/users/{UPN}/drive/root:/ROOT_FOLDER/subpath/filename:/content
     const prefix = root ? `${root}/${subpath}`.replace(/\/+$/,"") : subpath;
     const drivePath = prefix ? `${prefix}/${filename}` : filename;
 
+    // 注意：路徑內的 "/" 不能被編碼，因此先 encode 再把 %2F 還原
     const url =
       `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(upn)}` +
       `/drive/root:/${encodeURIComponent(drivePath).replace(/%2F/g,"/")}:/content`;
