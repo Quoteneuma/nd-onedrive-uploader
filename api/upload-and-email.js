@@ -200,12 +200,22 @@ export default async function handler(req, res) {
 
     const emailResult = await resend.emails.send(emailPayload);
 
-    return res.status(200).json({
-      ok: true,
-      uploaded_pdf: uploadedPdf,
-      uploaded_xlsx: uploadedXlsx,
-      email_id: emailResult?.data?.id || ""
-    });
+if (emailResult?.error) {
+  console.error("[RESEND_ERROR]", emailResult.error);
+  return res.status(500).json({
+    ok: false,
+    error: "EMAIL_SEND_FAILED",
+    resend_error: emailResult.error
+  });
+}
+
+return res.status(200).json({
+  ok: true,
+  uploaded_pdf: uploadedPdf,
+  uploaded_xlsx: uploadedXlsx,
+  email_id: emailResult?.data?.id || "",
+  email_result: emailResult
+});
   } catch (e) {
     console.error("[SERVER_ERROR]", e?.message || e);
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
