@@ -167,15 +167,9 @@ export default async function handler(req, res) {
       : "Your Quote Files";
 
     const textLines = [
-      `Hello ${customerName || "Customer"},`,
-      ``,
-      `Attached are your quote files.`,
-      quotationNo ? `Quote No: ${quotationNo}` : ``,
-      ``,
-      `Please find the PDF and Excel files attached.`,
-      ``,
-      `Thank you.`
-    ].filter(Boolean);
+  `Quote files attached.`,
+  quotationNo ? `Quote No: ${quotationNo}` : ``
+].filter(Boolean);
 
     const emailPayload = {
       from: fromEmail,
